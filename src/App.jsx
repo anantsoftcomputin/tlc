@@ -21,6 +21,15 @@ const languages = [
 
 const emptyProfile = { destination: '', departure_city: '', travel_dates: '', duration: '', budget: '', travelers: '', interests: [], hotel_style: '', pace: '' };
 
+function fallbackOptions(profile = emptyProfile, ready = false) {
+  if (!profile.departure_city) return [{emoji:'🏙️',label:'Mumbai',value:'We will depart from Mumbai'},{emoji:'✈️',label:'Delhi',value:'We will depart from Delhi'},{emoji:'🌆',label:'Bengaluru',value:'We will depart from Bengaluru'},{emoji:'🌉',label:'Kolkata',value:'We will depart from Kolkata'}];
+  if (!profile.travel_dates) return [{emoji:'🍂',label:'October',value:'We would like to travel in October 2026'},{emoji:'🌤️',label:'November',value:'We would like to travel in November 2026'},{emoji:'❄️',label:'December',value:'We would like to travel in December 2026'},{emoji:'🗓️',label:'Flexible',value:'Our dates are flexible'}];
+  if (!profile.duration) return [{emoji:'⚡',label:'5 days',value:'We have 5 days for this holiday'},{emoji:'✨',label:'7 days',value:'We have 7 days for this holiday'},{emoji:'🌿',label:'9 days',value:'We have 9 days for this holiday'}];
+  if (!profile.budget) return [{emoji:'💚',label:'Up to ₹2L',value:'Our total budget is up to ₹2 lakh'},{emoji:'⭐',label:'₹2–3 lakh',value:'Our total budget is between ₹2 and ₹3 lakh'},{emoji:'💎',label:'₹3–5 lakh',value:'Our total budget is between ₹3 and ₹5 lakh'}];
+  if (!ready && !profile.pace) return [{emoji:'🌿',label:'Relaxed',value:'We prefer a relaxed pace with free time'},{emoji:'⚖️',label:'Balanced',value:'We prefer a balanced pace'},{emoji:'⚡',label:'Active',value:'We prefer an active itinerary'}];
+  return [{emoji:'✨',label:'Looks perfect',value:'This direction looks perfect. Please create the package.'},{emoji:'🌿',label:'More relaxed',value:'Please make the pace more relaxed'},{emoji:'🧗',label:'More adventure',value:'Please add more family-friendly adventure'}];
+}
+
 function Logo({ dark = false }) {
   return <div className={`logo ${dark ? 'logo-dark' : ''}`}><span className="logo-mark">tlc</span><span className="logo-copy">TRAVELOS<small>INTELLIGENT CONCIERGE</small></span></div>;
 }
@@ -83,6 +92,8 @@ function Chat({ onBack, onComplete, onDemo }) {
   const [languageOpen, setLanguageOpen] = useState(false);
   const [listening, setListening] = useState(false);
   const [voiceMode, setVoiceMode] = useState(false);
+  const [voicePhase, setVoicePhase] = useState('idle');
+  const [voiceDraft, setVoiceDraft] = useState('');
   const [readyPkg, setReadyPkg] = useState(null);
   const [suggestions, setSuggestions] = useState(quickStarts);
   const bottomRef = useRef();
@@ -95,12 +106,17 @@ function Chat({ onBack, onComplete, onDemo }) {
   const audioContextRef = useRef(null);
   const audioNodesRef = useRef([]);
   const liveTranscriptRef = useRef('');
+  const voiceDraftRef = useRef('');
+  const voiceSubmitTimerRef = useRef(null);
+  const voiceFinalizeTimerRef = useRef(null);
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, loading]);
   useEffect(() => {
     return () => {
       stopLiveAudio(true);
+      clearTimeout(voiceSubmitTimerRef.current);
+      clearTimeout(voiceFinalizeTimerRef.current);
       voiceAudioRef.current?.pause();
       window.speechSynthesis?.cancel();
     };
@@ -108,6 +124,8 @@ function Chat({ onBack, onComplete, onDemo }) {
 
   async function send(text = input) {
     if (!text.trim() || loading) return;
+    clearTimeout(voiceSubmitTimerRef.current);
+    setVoicePhase('thinking');
     const next = [...messages, { role: 'user', content: text.trim() }];
     setMessages(next); setInput(''); setSuggestions([]); setLoading(true);
     try {
@@ -116,15 +134,19 @@ function Chat({ onBack, onComplete, onDemo }) {
       if (!res.ok) throw new Error(data.error);
       setMessages(m => [...m, { role: 'assistant', content: data.reply }]);
       setProfile(data.profile || emptyProfile); setCompletion(data.completion || 20);
-      setSuggestions(data.quick_replies || []);
+      setSuggestions(data.quick_replies?.length ? data.quick_replies : fallbackOptions(data.profile, data.ready_to_build));
       if (data.ready_to_build) setReadyPkg(data.package);
       if (voiceModeRef.current) speakWithGemini(data.reply);
+      else setVoicePhase('idle');
     } catch (e) {
       setMessages(m => [...m, { role: 'assistant', content: 'I have your brief. For this demo, could you also share your departure city, preferred month, trip duration, and approximate total budget?' }]);
+      setSuggestions(fallbackOptions(profile));
+      setVoicePhase('idle');
     } finally { setLoading(false); }
   }
 
   async function speakWithGemini(text) {
+    setVoicePhase('speaking');
     voiceAudioRef.current?.pause();
     window.speechSynthesis?.cancel();
     try {
@@ -136,28 +158,65 @@ function Chat({ onBack, onComplete, onDemo }) {
       const url = URL.createObjectURL(await response.blob());
       const audio = new Audio(url);
       voiceAudioRef.current = audio;
-      audio.onended = () => URL.revokeObjectURL(url);
-      audio.onerror = () => URL.revokeObjectURL(url);
+      audio.onended = () => { URL.revokeObjectURL(url); setVoicePhase('idle'); };
+      audio.onerror = () => { URL.revokeObjectURL(url); setVoicePhase('idle'); };
       await audio.play();
     } catch {
-      if (!('speechSynthesis' in window)) return;
+      if (!('speechSynthesis' in window)) { setVoicePhase('idle'); return; }
       const utterance = new SpeechSynthesisUtterance(text);
       utterance.lang = languageRef.current.code;
       utterance.rate = 0.98;
       const voices = window.speechSynthesis.getVoices();
       utterance.voice = voices.find(v => /samantha|karen|moira|ava|female/i.test(v.name) && v.lang.startsWith(languageRef.current.code.slice(0, 2))) || null;
+      utterance.onend = () => setVoicePhase('idle');
+      utterance.onerror = () => setVoicePhase('idle');
       window.speechSynthesis.speak(utterance);
     }
   }
 
-  function beginBrowserListening(selectedLanguage = language) {
+  function stageVoiceDraft(text) {
+    const clean = text.replace(/\s+/g, ' ').trim();
+    if (!clean) { setVoicePhase('idle'); return; }
+    voiceDraftRef.current = clean;
+    setVoiceDraft(clean);
+    setInput(clean);
+    setVoicePhase('reviewing');
+    clearTimeout(voiceSubmitTimerRef.current);
+    if (clean.split(' ').length >= 4) voiceSubmitTimerRef.current = setTimeout(() => commitVoiceDraft(), 1800);
+  }
+
+  function commitVoiceDraft() {
+    clearTimeout(voiceSubmitTimerRef.current);
+    const text = voiceDraftRef.current.trim();
+    if (!text) return;
+    setVoiceDraft('');
+    voiceDraftRef.current = '';
+    send(text);
+  }
+
+  function continueVoiceDraft() {
+    clearTimeout(voiceSubmitTimerRef.current);
+    const seed = voiceDraftRef.current;
+    setVoiceDraft('');
+    beginListening(languageRef.current, seed);
+  }
+
+  function cancelVoiceDraft() {
+    clearTimeout(voiceSubmitTimerRef.current);
+    voiceDraftRef.current = '';
+    setVoiceDraft('');
+    setInput('');
+    setVoicePhase('idle');
+  }
+
+  function beginBrowserListening(selectedLanguage = language, seed = '') {
     const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!Recognition) { setMessages(m => [...m, { role:'assistant', content:'Voice input is best experienced in Chrome or Edge. You can continue by typing naturally below.' }]); return; }
     window.speechSynthesis?.cancel();
     const recognition = new Recognition(); recognition.lang = selectedLanguage.code; recognition.interimResults = true; recognition.continuous = false;
-    recognition.onstart = () => setListening(true);
-    recognition.onresult = e => { const text = Array.from(e.results).map(r => r[0].transcript).join(''); setInput(text); if (e.results[e.results.length - 1].isFinal) setTimeout(() => send(text), 250); };
-    recognition.onend = () => setListening(false); recognition.onerror = () => setListening(false); recognition.start();
+    recognition.onstart = () => { setListening(true); setVoicePhase('listening'); };
+    recognition.onresult = e => { const text = `${seed ? `${seed.trim()} ` : ''}${Array.from(e.results).map(r => r[0].transcript).join('')}`; voiceDraftRef.current=text;setInput(text); };
+    recognition.onend = () => { setListening(false);stageVoiceDraft(voiceDraftRef.current); }; recognition.onerror = () => {setListening(false);setVoicePhase('idle')}; recognition.start();
   }
 
   function stopLiveAudio(closeSession = false) {
@@ -183,11 +242,14 @@ function Chat({ onBack, onComplete, onDemo }) {
     return btoa(binary);
   }
 
-  async function beginListening(selectedLanguage = language) {
+  async function beginListening(selectedLanguage = language, seed = '') {
     voiceAudioRef.current?.pause();
     window.speechSynthesis?.cancel();
-    liveTranscriptRef.current = '';
-    setInput('');
+    clearTimeout(voiceSubmitTimerRef.current);
+    clearTimeout(voiceFinalizeTimerRef.current);
+    liveTranscriptRef.current = seed ? `${seed.trim()} ` : '';
+    setInput(seed);
+    setVoicePhase('connecting');
     setListening(true);
     try {
       const tokenResponse = await fetch('/api/gemini-live-token');
@@ -201,6 +263,15 @@ function Chat({ onBack, onComplete, onDemo }) {
         config: {
           responseModalities: ['AUDIO'],
           inputAudioTranscription: {},
+          realtimeInputConfig: {
+            automaticActivityDetection: {
+              disabled: false,
+              startOfSpeechSensitivity: 'START_SENSITIVITY_LOW',
+              endOfSpeechSensitivity: 'END_SENSITIVITY_LOW',
+              prefixPaddingMs: 80,
+              silenceDurationMs: 1800
+            }
+          },
           systemInstruction: `You are listening to a TLC Holidays traveler speaking in ${selectedLanguage.name}. Listen naturally and acknowledge briefly. Respond in ${selectedLanguage.name}.`
         },
         callbacks: {
@@ -211,9 +282,12 @@ function Chat({ onBack, onComplete, onDemo }) {
               setInput(liveTranscriptRef.current.trim());
             }
             if (message.serverContent?.turnComplete) {
-              const finalText = liveTranscriptRef.current.trim();
-              stopLiveAudio(true);
-              if (finalText) send(finalText);
+              clearTimeout(voiceFinalizeTimerRef.current);
+              voiceFinalizeTimerRef.current = setTimeout(() => {
+                const finalText = liveTranscriptRef.current.trim();
+                stopLiveAudio(true);
+                stageVoiceDraft(finalText);
+              }, 450);
             }
           },
           onerror: () => {
@@ -238,9 +312,10 @@ function Chat({ onBack, onComplete, onDemo }) {
       };
       source.connect(processor); processor.connect(silent); silent.connect(context.destination);
       audioNodesRef.current = [source, processor, silent];
+      setVoicePhase('listening');
     } catch (error) {
       stopLiveAudio(true);
-      beginBrowserListening(selectedLanguage);
+      beginBrowserListening(selectedLanguage, seed);
     }
   }
 
@@ -254,23 +329,25 @@ function Chat({ onBack, onComplete, onDemo }) {
     ['Travel party', profile.travelers, Users], ['Destination', profile.destination, MapPin], ['Dates', profile.travel_dates, CalendarDays],
     ['Duration', profile.duration, Clock3], ['Budget', profile.budget, WalletCards], ['Travel style', profile.pace || profile.hotel_style, Compass]
   ];
+  const phaseCopy = { connecting: 'Connecting securely…', listening: 'Listening — take your time', reviewing: 'Confirming what we heard', thinking: 'Curating your next step…', speaking: 'Aira is speaking' };
   return <main className="chat-shell">
     <header className="chat-header"><button className="icon-btn" onClick={onBack}><ArrowLeft/></button><Logo dark/><div className="header-right"><button className="lang-button" onClick={() => setLanguageOpen(true)}><Languages size={17}/>{language.native}<ChevronDown size={14}/></button><button className="ghost" onClick={onDemo}>Skip to demo</button></div></header>
     <div className="chat-layout">
       <section className="conversation">
-        <div className="conversation-heading"><div><span className="status-dot"/> Aira is online <span className="gemini-badge"><Sparkles size={10}/> Gemini powered</span></div><small>Tap an answer or tell Aira naturally.</small></div>
+        <div className="conversation-heading"><div><span className={`status-dot ${voicePhase!=='idle'?'active':''}`}/> Aira is online <span className="gemini-badge"><Sparkles size={10}/> Gemini Live</span></div><small>{phaseCopy[voicePhase] || 'Tap an answer or speak naturally — no forms.'}</small></div>
         <div className="messages">
           {messages.map((m,i) => <div key={i} className={`message-row ${m.role}`}>
             {m.role === 'assistant' && <div className="bot-avatar">A</div>}
             <div className="bubble">{m.content}{m.role === 'assistant' && <span className="delivered"><Volume2 size={12}/> Aira</span>}</div>
           </div>)}
           {!loading && !!suggestions.length && <div className="smart-replies"><div className="smart-replies-label"><Sparkles size={12}/> QUICK ANSWERS · NO TYPING NEEDED</div><div className="smart-replies-grid">{suggestions.map((q,i) => <button key={`${q.label}-${i}`} onClick={() => send(q.value || q.label)}><i>{q.emoji || '✨'}</i><span>{q.label}</span><ArrowRight size={14}/></button>)}<button className="type-own" onClick={() => inputRef.current?.focus()}><i>⌨️</i><span>I’ll type my own</span></button></div></div>}
-          {loading && <div className="message-row assistant"><div className="bot-avatar">A</div><div className="bubble typing"><i/><i/><i/></div></div>}
+          {loading && <div className="message-row assistant"><div className="bot-avatar">A</div><div className="bubble thinking-bubble"><span className="thinking-orbit"><Sparkles/></span><div><b>Aira is curating</b><small>Understanding your preferences and preparing the best next choices…</small></div></div></div>}
           {readyPkg && <div className="package-ready"><div className="ready-icon"><WandSparkles/></div><div><b>Your journey is ready</b><span>{readyPkg.title} · {readyPkg.price}</span></div><button className="primary" onClick={() => onComplete(readyPkg, profile)}>Reveal my trip <ArrowRight size={16}/></button></div>}
           <div ref={bottomRef}/>
         </div>
         <div className="composer-wrap">
-          {listening && <div className="listening-bar"><span className="waves"><i/><i/><i/><i/><i/></span>Gemini Live is listening in {language.name}… <button onClick={() => stopLiveAudio(false)}>Tap to finish</button></div>}
+          {(voicePhase==='connecting'||voicePhase==='listening') && <div className="listening-bar"><span className="waves"><i/><i/><i/><i/><i/></span><span><b>{voicePhase==='connecting'?'Preparing private voice session…':`Listening in ${language.name}`}</b><small>{voicePhase==='listening'?'Pause naturally — Aira waits for you to finish.':''}</small></span>{voicePhase==='listening'&&<button onClick={() => stopLiveAudio(false)}>I’m done</button>}</div>}
+          {voicePhase==='reviewing' && <div className="voice-review"><div className="voice-review-head"><CheckCircle2/><span><b>Here’s what I heard</b><small>{voiceDraft.split(' ').length<4?'Keep speaking or send when ready.':'Sending shortly — continue if you weren’t finished.'}</small></span><button onClick={cancelVoiceDraft}><X/></button></div><p>“{voiceDraft}”</p><div><button onClick={continueVoiceDraft}><Mic/> Continue speaking</button><button className="confirm-voice" onClick={commitVoiceDraft}>Use this <ArrowRight/></button></div></div>}
           <div className="composer"><button className={`mic-button ${listening ? 'active' : ''}`} onClick={startVoice}><Mic/></button><textarea ref={inputRef} value={input} onChange={e => setInput(e.target.value)} onKeyDown={e => { if(e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); send(); }}} placeholder={suggestions.length ? 'Or type something different…' : 'Tell Aira what you have in mind…'} rows="1"/><button className="send-button" onClick={() => send()} disabled={!input.trim() || loading}><Send/></button></div>
           <small>AI can make mistakes. Your TLC specialist verifies availability and important details.</small>
         </div>

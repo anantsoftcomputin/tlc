@@ -160,7 +160,12 @@ app.post('/api/concierge', async (req, res) => {
     if (!response.ok) throw new Error(data?.error?.message || 'Gemini request failed');
     const text = data.candidates?.[0]?.content?.parts?.map(part => part.text || '').join('');
     const result = JSON.parse(text);
-    res.json({ ...result, provider: 'gemini' });
+    const fallback = demoFallback(req.body.messages || []);
+    const validQuickReplies = Array.isArray(result.quick_replies)
+      ? result.quick_replies.filter(option => option?.label && option?.value).slice(0, 6)
+      : [];
+    const quickReplies = validQuickReplies.length >= 3 ? validQuickReplies : fallback.quick_replies;
+    res.json({ ...result, quick_replies: quickReplies, provider: 'gemini' });
   } catch (error) {
     console.error(error);
     res.json(demoFallback(req.body.messages || []));
@@ -177,7 +182,19 @@ app.get('/api/gemini-live-token', async (_req, res) => {
         expireTime: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
         liveConnectConstraints: {
           model: 'gemini-3.1-flash-live-preview',
-          config: { responseModalities: ['AUDIO'], inputAudioTranscription: {} }
+          config: {
+            responseModalities: ['AUDIO'],
+            inputAudioTranscription: {},
+            realtimeInputConfig: {
+              automaticActivityDetection: {
+                disabled: false,
+                startOfSpeechSensitivity: 'START_SENSITIVITY_LOW',
+                endOfSpeechSensitivity: 'END_SENSITIVITY_LOW',
+                prefixPaddingMs: 80,
+                silenceDurationMs: 1800
+              }
+            }
+          }
         }
       }
     });

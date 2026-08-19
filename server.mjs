@@ -1,16 +1,21 @@
 import express from 'express';
 import dotenv from 'dotenv';
 import { createServer as createViteServer } from 'vite';
+import { GoogleGenAI } from '@google/genai';
 
 dotenv.config();
 const app = express();
 app.use(express.json({ limit: '2mb' }));
 
-const apiKey = process.env.OPENAI_API_KEY || process.env['OPENAI-API'];
+const geminiApiKey = process.env.GEMINI_API_KEY || process.env.gemini_api_key;
 
 const systemPrompt = `You are Aira, TLC Holidays' expert India travel concierge. You have a warm, concise, highly attentive voice. Your job is to discover what would make a genuinely great holiday and then create a thoughtful package.
 
 Ask only ONE useful question per turn. Do not repeat facts the traveler already gave. Prioritize, in order: departure city, approximate dates or month, number of nights, total budget, pace, interests, hotel comfort, food or mobility needs. When enough information is present (destination/region, travelers, dates/month, duration, budget), set ready_to_build true and create a package. Make sensible assumptions for lesser preferences and clearly list them.
+
+Make this a tap-first experience. For every question, include 3 to 6 concise quick_replies that are realistic answers to the exact question. Each option needs a short label, the complete value to send back, and one suitable emoji. If the trip is ready, return quick_replies for refinement such as “Looks perfect”, “Change the pace”, and “Adjust budget”. Never include an “Other” option because the interface provides it automatically.
+
+TLC is an Indian travel company. Unless the traveler explicitly says otherwise, suggest Indian departure cities, show budgets in Indian rupees, and use Indian travel context.
 
 This is a prototype. Never claim live availability or confirmed prices. For emergencies, tell users to call local emergency services rather than relying solely on the app. Return valid JSON matching the requested shape. Keep reply under 70 words.`;
 
@@ -20,6 +25,9 @@ const schema = {
     reply: { type: 'string' },
     ready_to_build: { type: 'boolean' },
     completion: { type: 'integer' },
+    quick_replies: { type: 'array', items: { type: 'object', additionalProperties: false, properties: {
+      label: { type: 'string' }, value: { type: 'string' }, emoji: { type: 'string' }
+    }, required: ['label','value','emoji'] } },
     profile: {
       type: 'object', additionalProperties: false,
       properties: {
@@ -41,7 +49,7 @@ const schema = {
         assumptions: { type: 'array', items: { type: 'string' } }
       }, required: ['title','subtitle','price','days','highlights','assumptions']
     }
-  }, required: ['reply','ready_to_build','completion','profile','package']
+  }, required: ['reply','ready_to_build','completion','quick_replies','profile','package']
 };
 
 function demoFallback(messages) {
@@ -86,8 +94,17 @@ function demoFallback(messages) {
   else if (!profile.budget) reply = 'And what approximate total budget would you like me to design around, including stays and local travel?';
   else reply = 'I have enough to shape something special. I’ve kept the rhythm family-friendly, mixed signature nature experiences with breathing room, and prepared a first journey for you.';
   const ready = essentials.every(Boolean);
+  const quickReplies = !profile.departure_city ? [
+    {label:'Mumbai',value:'We will depart from Mumbai',emoji:'🏙️'},{label:'Delhi',value:'We will depart from Delhi',emoji:'✈️'},{label:'Bengaluru',value:'We will depart from Bengaluru',emoji:'🌆'}
+  ] : !profile.travel_dates ? [
+    {label:'October',value:'We would like to travel in October 2026',emoji:'🍂'},{label:'November',value:'We would like to travel in November 2026',emoji:'🌤️'},{label:'December',value:'We would like to travel in December 2026',emoji:'❄️'}
+  ] : !profile.duration ? [
+    {label:'5 days',value:'We have 5 days for this holiday',emoji:'⚡'},{label:'7 days',value:'We have 7 days for this holiday',emoji:'✨'},{label:'9 days',value:'We have 9 days for this holiday',emoji:'🌿'}
+  ] : !profile.budget ? [
+    {label:'Up to ₹2L',value:'Our total budget is up to ₹2 lakh',emoji:'💚'},{label:'₹2–3 lakh',value:'Our total budget is between ₹2 and ₹3 lakh',emoji:'⭐'},{label:'₹3–5 lakh',value:'Our total budget is between ₹3 and ₹5 lakh',emoji:'💎'}
+  ] : [{label:'Looks perfect',value:'This direction looks perfect. Please create the package.',emoji:'✨'},{label:'More relaxed',value:'Please make the pace more relaxed',emoji:'🌿'},{label:'More adventure',value:'Please add more family-friendly adventure',emoji:'🧗'}];
   return {
-    reply, ready_to_build: ready, completion, profile,
+    reply, ready_to_build: ready, completion, quick_replies: quickReplies, profile,
     package: {
       title: profile.pace === 'Relaxed' ? 'The Gentle Wild of Meghalaya' : 'Clouds, Canyons & Living Roots',
       subtitle: `A ${profile.duration || '7-day'} family journey through Meghalaya`,
@@ -108,26 +125,48 @@ function demoFallback(messages) {
 }
 
 app.post('/api/concierge', async (req, res) => {
-  if (!apiKey) return res.status(503).json({ error: 'OpenAI API key is not configured.' });
+  if (!geminiApiKey) return res.json(demoFallback(req.body.messages || []));
   try {
     const messages = Array.isArray(req.body.messages) ? req.body.messages.slice(-16) : [];
-    const response = await fetch('https://api.openai.com/v1/responses', {
+    const model = process.env.GEMINI_MODEL || 'gemini-3-flash-preview';
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': geminiApiKey },
       body: JSON.stringify({
-        model: process.env.OPENAI_MODEL || 'gpt-4.1-mini',
-        instructions: systemPrompt,
-        input: messages.map(m => ({ role: m.role, content: m.content })),
-        text: { format: { type: 'json_schema', name: 'travel_concierge', strict: true, schema } }
+        systemInstruction: { parts: [{ text: systemPrompt }] },
+        contents: messages.map(m => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] })),
+        generationConfig: { responseMimeType: 'application/json', responseJsonSchema: schema, temperature: 0.45 }
       })
     });
     const data = await response.json();
-    if (!response.ok) throw new Error(data?.error?.message || 'OpenAI request failed');
-    const text = data.output?.flatMap(o => o.content || []).find(c => c.type === 'output_text')?.text;
-    res.json(JSON.parse(text));
+    if (!response.ok) throw new Error(data?.error?.message || 'Gemini request failed');
+    const text = data.candidates?.[0]?.content?.parts?.map(part => part.text || '').join('');
+    const result = JSON.parse(text);
+    res.json({ ...result, provider: 'gemini' });
   } catch (error) {
     console.error(error);
     res.json(demoFallback(req.body.messages || []));
+  }
+});
+
+app.get('/api/gemini-live-token', async (_req, res) => {
+  if (!geminiApiKey) return res.status(503).json({ error: 'Gemini API key is not configured.' });
+  try {
+    const client = new GoogleGenAI({ apiKey: geminiApiKey });
+    const token = await client.authTokens.create({
+      config: {
+        uses: 1,
+        expireTime: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+        liveConnectConstraints: {
+          model: 'gemini-3.1-flash-live-preview',
+          config: { responseModalities: ['AUDIO'], inputAudioTranscription: {} }
+        }
+      }
+    });
+    res.json({ token: token.name, model: 'gemini-3.1-flash-live-preview' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: error.message });
   }
 });
 

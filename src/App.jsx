@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   ArrowLeft, ArrowRight, Bell, CalendarDays, Check, CheckCircle2, ChevronDown,
   CircleHelp, Clock3, Compass, Headphones, Heart, Hotel, Languages, LocateFixed,
@@ -8,7 +8,11 @@ import {
 import { alerts, demoPackage, experiences, hotels } from './demoData';
 import hero from './assets/meghalaya-hero.jpg';
 
-const quickStarts = ['Family adventure in North East', 'A relaxing premium escape', 'Something children will remember'];
+const quickStarts = [
+  { emoji: '👨‍👩‍👧‍👧', label: 'Family adventure', value: 'We want a memorable family adventure in North East India' },
+  { emoji: '🌿', label: 'Relaxing escape', value: 'We want a relaxed premium holiday surrounded by nature' },
+  { emoji: '✨', label: 'Surprise us', value: 'Surprise us with an amazing experience that children will remember' }
+];
 const languages = [
   { code: 'en-IN', name: 'English', native: 'English' }, { code: 'hi-IN', name: 'Hindi', native: 'हिन्दी' },
   { code: 'gu-IN', name: 'Gujarati', native: 'ગુજરાતી' }, { code: 'mr-IN', name: 'Marathi', native: 'मराठी' },
@@ -69,36 +73,149 @@ function Chat({ onBack, onComplete, onDemo }) {
   const [language, setLanguage] = useState(languages[0]);
   const [languageOpen, setLanguageOpen] = useState(false);
   const [listening, setListening] = useState(false);
+  const [voiceMode, setVoiceMode] = useState(false);
   const [readyPkg, setReadyPkg] = useState(null);
+  const [suggestions, setSuggestions] = useState(quickStarts);
   const bottomRef = useRef();
+  const inputRef = useRef();
+  const liveSessionRef = useRef(null);
+  const voiceModeRef = useRef(false);
+  const languageRef = useRef(languages[0]);
+  const mediaStreamRef = useRef(null);
+  const audioContextRef = useRef(null);
+  const audioNodesRef = useRef([]);
+  const liveTranscriptRef = useRef('');
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, loading]);
+  useEffect(() => {
+    return () => {
+      stopLiveAudio(true);
+      window.speechSynthesis?.cancel();
+    };
+  }, []);
 
   async function send(text = input) {
     if (!text.trim() || loading) return;
     const next = [...messages, { role: 'user', content: text.trim() }];
-    setMessages(next); setInput(''); setLoading(true);
+    setMessages(next); setInput(''); setSuggestions([]); setLoading(true);
     try {
       const res = await fetch('/api/concierge', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ messages: next }) });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error);
       setMessages(m => [...m, { role: 'assistant', content: data.reply }]);
       setProfile(data.profile || emptyProfile); setCompletion(data.completion || 20);
+      setSuggestions(data.quick_replies || []);
       if (data.ready_to_build) setReadyPkg(data.package);
+      if (voiceModeRef.current && 'speechSynthesis' in window) {
+        window.speechSynthesis.cancel();
+        const utterance = new SpeechSynthesisUtterance(data.reply);
+        utterance.lang = languageRef.current.code;
+        utterance.rate = 1.02;
+        window.speechSynthesis.speak(utterance);
+      }
     } catch (e) {
       setMessages(m => [...m, { role: 'assistant', content: 'I have your brief. For this demo, could you also share your departure city, preferred month, trip duration, and approximate total budget?' }]);
     } finally { setLoading(false); }
   }
 
-  function startVoice() {
-    if (!languageOpen && !listening && language === languages[0]) { setLanguageOpen(true); return; }
+  function beginBrowserListening(selectedLanguage = language) {
     const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!Recognition) { setMessages(m => [...m, { role:'assistant', content:'Voice input is best experienced in Chrome or Edge. You can continue by typing naturally below.' }]); return; }
-    const recognition = new Recognition(); recognition.lang = language.code; recognition.interimResults = true; recognition.continuous = false;
+    window.speechSynthesis?.cancel();
+    const recognition = new Recognition(); recognition.lang = selectedLanguage.code; recognition.interimResults = true; recognition.continuous = false;
     recognition.onstart = () => setListening(true);
     recognition.onresult = e => { const text = Array.from(e.results).map(r => r[0].transcript).join(''); setInput(text); if (e.results[e.results.length - 1].isFinal) setTimeout(() => send(text), 250); };
     recognition.onend = () => setListening(false); recognition.onerror = () => setListening(false); recognition.start();
+  }
+
+  function stopLiveAudio(closeSession = false) {
+    for (const node of audioNodesRef.current) { try { node.disconnect(); } catch {} }
+    audioNodesRef.current = [];
+    mediaStreamRef.current?.getTracks().forEach(track => track.stop());
+    mediaStreamRef.current = null;
+    if (audioContextRef.current && audioContextRef.current.state !== 'closed') audioContextRef.current.close();
+    audioContextRef.current = null;
+    if (liveSessionRef.current) {
+      try { liveSessionRef.current.sendRealtimeInput({ audioStreamEnd: true }); } catch {}
+      if (closeSession) { try { liveSessionRef.current.close(); } catch {} liveSessionRef.current = null; }
+    }
+    setListening(false);
+  }
+
+  function pcmToBase64(samples) {
+    const pcm = new Int16Array(samples.length);
+    for (let i = 0; i < samples.length; i++) pcm[i] = Math.max(-1, Math.min(1, samples[i])) * 0x7fff;
+    const bytes = new Uint8Array(pcm.buffer);
+    let binary = '';
+    for (let i = 0; i < bytes.length; i += 8192) binary += String.fromCharCode(...bytes.subarray(i, i + 8192));
+    return btoa(binary);
+  }
+
+  async function beginListening(selectedLanguage = language) {
+    window.speechSynthesis?.cancel();
+    liveTranscriptRef.current = '';
+    setInput('');
+    setListening(true);
+    try {
+      const tokenResponse = await fetch('/api/gemini-live-token');
+      const credentials = await tokenResponse.json();
+      if (!tokenResponse.ok) throw new Error(credentials.error || 'Could not start Gemini Live');
+      const { GoogleGenAI } = await import('@google/genai');
+      const ai = new GoogleGenAI({ apiKey: credentials.token, httpOptions: { apiVersion: 'v1alpha' } });
+      let session;
+      session = await ai.live.connect({
+        model: credentials.model,
+        config: {
+          responseModalities: ['AUDIO'],
+          inputAudioTranscription: {},
+          systemInstruction: `You are listening to a TLC Holidays traveler speaking in ${selectedLanguage.name}. Listen naturally and acknowledge briefly. Respond in ${selectedLanguage.name}.`
+        },
+        callbacks: {
+          onmessage: message => {
+            const transcript = message.serverContent?.inputTranscription?.text;
+            if (transcript) {
+              liveTranscriptRef.current += transcript;
+              setInput(liveTranscriptRef.current.trim());
+            }
+            if (message.serverContent?.turnComplete) {
+              const finalText = liveTranscriptRef.current.trim();
+              stopLiveAudio(true);
+              if (finalText) send(finalText);
+            }
+          },
+          onerror: () => {
+            stopLiveAudio(true);
+            beginBrowserListening(selectedLanguage);
+          },
+          onclose: () => setListening(false)
+        }
+      });
+      liveSessionRef.current = session;
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } });
+      mediaStreamRef.current = stream;
+      const context = new AudioContext({ sampleRate: 16000 });
+      audioContextRef.current = context;
+      const source = context.createMediaStreamSource(stream);
+      const processor = context.createScriptProcessor(1024, 1, 1);
+      const silent = context.createGain(); silent.gain.value = 0;
+      processor.onaudioprocess = event => {
+        if (!liveSessionRef.current) return;
+        const data = pcmToBase64(event.inputBuffer.getChannelData(0));
+        session.sendRealtimeInput({ audio: { data, mimeType: `audio/pcm;rate=${context.sampleRate}` } });
+      };
+      source.connect(processor); processor.connect(silent); silent.connect(context.destination);
+      audioNodesRef.current = [source, processor, silent];
+    } catch (error) {
+      stopLiveAudio(true);
+      beginBrowserListening(selectedLanguage);
+    }
+  }
+
+  function startVoice() {
+    if (!voiceMode) { setLanguageOpen(true); return; }
+    if (listening) { stopLiveAudio(false); return; }
+    beginListening(language);
   }
 
   const facts = [
@@ -109,20 +226,20 @@ function Chat({ onBack, onComplete, onDemo }) {
     <header className="chat-header"><button className="icon-btn" onClick={onBack}><ArrowLeft/></button><Logo dark/><div className="header-right"><button className="lang-button" onClick={() => setLanguageOpen(true)}><Languages size={17}/>{language.native}<ChevronDown size={14}/></button><button className="ghost" onClick={onDemo}>Skip to demo</button></div></header>
     <div className="chat-layout">
       <section className="conversation">
-        <div className="conversation-heading"><div><span className="status-dot"/> Aira is online</div><small>Your thoughts become a trip, one detail at a time.</small></div>
+        <div className="conversation-heading"><div><span className="status-dot"/> Aira is online <span className="gemini-badge"><Sparkles size={10}/> Gemini powered</span></div><small>Tap an answer or tell Aira naturally.</small></div>
         <div className="messages">
           {messages.map((m,i) => <div key={i} className={`message-row ${m.role}`}>
             {m.role === 'assistant' && <div className="bot-avatar">A</div>}
             <div className="bubble">{m.content}{m.role === 'assistant' && <span className="delivered"><Volume2 size={12}/> Aira</span>}</div>
           </div>)}
-          {messages.length === 1 && <div className="quick-starts">{quickStarts.map(q => <button key={q} onClick={() => send(q)}>{q}<ArrowRight size={14}/></button>)}</div>}
+          {!loading && !!suggestions.length && <div className="smart-replies"><div className="smart-replies-label"><Sparkles size={12}/> QUICK ANSWERS · NO TYPING NEEDED</div><div className="smart-replies-grid">{suggestions.map((q,i) => <button key={`${q.label}-${i}`} onClick={() => send(q.value || q.label)}><i>{q.emoji || '✨'}</i><span>{q.label}</span><ArrowRight size={14}/></button>)}<button className="type-own" onClick={() => inputRef.current?.focus()}><i>⌨️</i><span>I’ll type my own</span></button></div></div>}
           {loading && <div className="message-row assistant"><div className="bot-avatar">A</div><div className="bubble typing"><i/><i/><i/></div></div>}
           {readyPkg && <div className="package-ready"><div className="ready-icon"><WandSparkles/></div><div><b>Your journey is ready</b><span>{readyPkg.title} · {readyPkg.price}</span></div><button className="primary" onClick={() => onComplete(readyPkg, profile)}>Reveal my trip <ArrowRight size={16}/></button></div>}
           <div ref={bottomRef}/>
         </div>
         <div className="composer-wrap">
-          {listening && <div className="listening-bar"><span className="waves"><i/><i/><i/><i/><i/></span>Listening in {language.name}… <button onClick={() => setListening(false)}>Tap to stop</button></div>}
-          <div className="composer"><button className={`mic-button ${listening ? 'active' : ''}`} onClick={startVoice}><Mic/></button><textarea value={input} onChange={e => setInput(e.target.value)} onKeyDown={e => { if(e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); send(); }}} placeholder="Tell Aira what you have in mind…" rows="1"/><button className="send-button" onClick={() => send()} disabled={!input.trim() || loading}><Send/></button></div>
+          {listening && <div className="listening-bar"><span className="waves"><i/><i/><i/><i/><i/></span>Gemini Live is listening in {language.name}… <button onClick={() => stopLiveAudio(false)}>Tap to finish</button></div>}
+          <div className="composer"><button className={`mic-button ${listening ? 'active' : ''}`} onClick={startVoice}><Mic/></button><textarea ref={inputRef} value={input} onChange={e => setInput(e.target.value)} onKeyDown={e => { if(e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); send(); }}} placeholder={suggestions.length ? 'Or type something different…' : 'Tell Aira what you have in mind…'} rows="1"/><button className="send-button" onClick={() => send()} disabled={!input.trim() || loading}><Send/></button></div>
           <small>AI can make mistakes. Your TLC specialist verifies availability and important details.</small>
         </div>
       </section>
@@ -134,7 +251,7 @@ function Chat({ onBack, onComplete, onDemo }) {
         <div className="privacy-note"><ShieldCheck/><span><b>Your conversation is private</b><small>Used only to design and service your trip.</small></span></div>
       </aside>
     </div>
-    {languageOpen && <div className="modal-backdrop" onClick={() => setLanguageOpen(false)}><div className="language-modal" onClick={e=>e.stopPropagation()}><button className="modal-x" onClick={()=>setLanguageOpen(false)}><X/></button><div className="modal-icon"><Mic/></div><h2>Which language shall we speak?</h2><p>Aira can understand natural conversation in your preferred language.</p><div className="language-grid">{languages.map(l => <button className={l.code === language.code ? 'selected' : ''} key={l.code} onClick={() => { setLanguage(l); setLanguageOpen(false); setTimeout(startVoice, 100); }}><b>{l.native}</b><span>{l.name}</span>{l.code === language.code && <Check/>}</button>)}</div><small>You can change this anytime.</small></div></div>}
+    {languageOpen && <div className="modal-backdrop" onClick={() => setLanguageOpen(false)}><div className="language-modal" onClick={e=>e.stopPropagation()}><button className="modal-x" onClick={()=>setLanguageOpen(false)}><X/></button><div className="modal-icon"><Mic/></div><h2>Which language shall we speak?</h2><p>Aira will listen in your language and speak Gemini’s response back naturally.</p><div className="language-grid">{languages.map(l => <button className={l.code === language.code ? 'selected' : ''} key={l.code} onClick={() => { languageRef.current = l; voiceModeRef.current = true; setLanguage(l); setVoiceMode(true); setLanguageOpen(false); setTimeout(() => beginListening(l), 120); }}><b>{l.native}</b><span>{l.name}</span>{l.code === language.code && <Check/>}</button>)}</div><small>Your Gemini key stays securely on the server.</small></div></div>}
   </main>;
 }
 

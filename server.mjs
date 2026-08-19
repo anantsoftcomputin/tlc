@@ -124,6 +124,24 @@ function demoFallback(messages) {
   };
 }
 
+function pcmToWav(pcm, sampleRate = 24000) {
+  const header = Buffer.alloc(44);
+  header.write('RIFF', 0);
+  header.writeUInt32LE(36 + pcm.length, 4);
+  header.write('WAVE', 8);
+  header.write('fmt ', 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(1, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(sampleRate * 2, 28);
+  header.writeUInt16LE(2, 32);
+  header.writeUInt16LE(16, 34);
+  header.write('data', 36);
+  header.writeUInt32LE(pcm.length, 40);
+  return Buffer.concat([header, pcm]);
+}
+
 app.post('/api/concierge', async (req, res) => {
   if (!geminiApiKey) return res.json(demoFallback(req.body.messages || []));
   try {
@@ -164,6 +182,35 @@ app.get('/api/gemini-live-token', async (_req, res) => {
       }
     });
     res.json({ token: token.name, model: 'gemini-3.1-flash-live-preview' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/speech', async (req, res) => {
+  if (!geminiApiKey) return res.status(503).json({ error: 'Gemini API key is not configured.' });
+  const text = String(req.body.text || '').trim().slice(0, 1200);
+  if (!text) return res.status(400).json({ error: 'Speech text is required.' });
+  try {
+    const response = await fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-tts-preview:generateContent', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': geminiApiKey },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: `Synthesize speech for the transcript below.\n\nVoice profile: warm, polished adult female travel concierge. Calm confidence, natural conversational rhythm, subtle Indian English pronunciation, gentle warmth, crisp articulation, medium pace. Sound premium and human, never theatrical, breathy, robotic, or overly cheerful. Do not add, remove, or paraphrase words.\n\nTranscript:\n${text}` }] }],
+        generationConfig: {
+          responseModalities: ['AUDIO'],
+          speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Aoede' } } }
+        }
+      })
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data?.error?.message || 'Gemini speech generation failed');
+    const audio = data.candidates?.[0]?.content?.parts?.find(part => part.inlineData)?.inlineData;
+    if (!audio?.data) throw new Error('Gemini did not return audio');
+    const pcm = Buffer.from(audio.data, 'base64');
+    res.set({ 'Content-Type': 'audio/wav', 'Cache-Control': 'no-store' });
+    res.send(pcmToWav(pcm, 24000));
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: error.message });
